@@ -92,6 +92,7 @@ class Keithley6514(Device):
             print(ans)
             if "MODEL 6514" in ans:
                 self._trigger = TriggerMode.AUTO
+                self._bufsize = 0
                 self.reset_device()
                 self.set_state(DevState.ON)
             else:
@@ -105,6 +106,11 @@ class Keithley6514(Device):
 
     def always_executed_hook(self):
         # print(f"always_executed_hook: {ans}", file=self.log_debug)
+        if self.get_state() == DevState.MOVING:
+            count = int(self.inst.query("TRAC:POIN:ACT?"))
+            if count >= self._bufsize:
+                self.set_state(DevState.ON)
+
         pass
 
     def read_current(self):
@@ -187,27 +193,33 @@ class Keithley6514(Device):
     @command(dtype_in=int)
     def configure_buffer(self, num):
         """Store up to <num> raw readings and time stamps in buffer.
-        Storing starts immediately, so trigger should be configured first.
         """
+        assert num <= 2500, "Maximum buffer size is 2500"
         print(f"Enabling data buffer with size {num}", file=self.log_debug)
         commands = [
             "TRAC:CLE",
             f"TRAC:POIN {num:d}",
             "TRAC:FEED SENS",
-            "TRAC:FEED:CONT NEXT",
+            # "TRAC:FEED:CONT NEXT",
             ]
         for cmd in commands:
             self.inst.write(cmd)
+        self._bufsize = num
+
+    @command
+    def start_save_in_buffer(self):
+        self.inst.write("TRAC:FEED:CONT NEXT")
+        self.set_state(DevState.MOVING)
 
     @command(dtype_out=(float,))
     def read_buffer(self):
         """Return stored data from buffer."""
         count = int(self.inst.query("TRAC:POIN:ACT?"))
         if count > 0:
-            data = np.array(self.inst.query_ascii_values("TRAC:DATA?"))
+            data = np.array(self.inst.query_ascii_values("TRAC:DATA?")[::2])
             print(f"Read buffer: {count}", file=self.log_debug)
         else:
-            data = np.array([-1, -1])
+            data = np.array([-1,])
             print(f"Read buffer: empty!", file=self.log_warn)
         return data
 
@@ -215,6 +227,14 @@ class Keithley6514(Device):
     def read_and_clear_errors(self):
         ans = self.inst.query("SYST:ERR:ALL?")
         return ans
+
+    @command
+    def abort(self):
+        """Abort a running triggered measurement"""
+        if self.get_state() == DevState.MOVING:
+            print("ABORT trigger", file=self.log_debug)
+            self.inst.write("ABORT")
+            self.set_state(DevState.ON)
 
 
 
