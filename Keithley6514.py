@@ -52,8 +52,8 @@ class Keithley6514(Device):
         dtype=float,
         min_value=0.01,
         max_value=10,
-        doc=("Integration time in number of power line cycles.\n"
-             "Device defaults are SLOW (5), MEDIUM (1) and FAST (0.1)\n")
+        doc="""Integration time in number of power line cycles
+             Device defaults are SLOW (5), MEDIUM (1) and FAST (0.1)\n"""
         )
 
     current = attribute(
