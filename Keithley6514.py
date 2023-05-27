@@ -11,12 +11,13 @@ This is a rudimentary driver to enable diode current measurements
 
 import pyvisa
 import tango
-from tango import DevState
+from tango import DevState, AttrQuality
 from tango.server import Device, attribute, command
 from tango.server import device_property
 from tango import READ, READ_WRITE
 import numpy as np
 import sys
+import time
 from enum import IntEnum
 
 
@@ -86,9 +87,10 @@ class Keithley6514(Device):
         self.inst = self.rm.open_resource(f"GPIB::{self.gpib_addr}::INSTR")
         self.inst.read_termination = '\n'
         self.inst.write_termination = '\n'
+        self.inst.timeout = 1000
         self.inst.clear()
         try:
-            ans = self.inst.query("*IDN?")
+            ans = self.query_device("*IDN?")
             print(ans)
             if "MODEL 6514" in ans:
                 self._trigger = TriggerMode.AUTO
@@ -107,20 +109,34 @@ class Keithley6514(Device):
     def always_executed_hook(self):
         # print(f"always_executed_hook: {ans}", file=self.log_debug)
         if self.get_state() == DevState.MOVING:
-            count = int(self.inst.query("TRAC:POIN:ACT?"))
-            if count >= self._bufsize:
-                self.set_state(DevState.ON)
-
-        pass
+            try:  # can't communicate while measuring
+                count = int(self.query_device("TRAC:POIN:ACT?"))
+                if count >= self._bufsize:
+                    self.set_state(DevState.ON)
+                    self.read_and_clear_errors()
+                    self._configure_singleshot()
+            except Exception as exc:
+                print(
+                    f"Timeout and device in moving state: measurement ongoing",
+                    exc,
+                    file=self.log_debug
+                )
 
     def read_current(self):
-        if self._trigger == TriggerMode.AUTO:
-            # trigger and request fresh reading
-            ans = self.inst.query_ascii_values("READ?")
+        if self.get_state() == DevState.ON:
+            if self._trigger == TriggerMode.AUTO:
+                # trigger and request fresh reading
+                cmd = "READ?"
+            else:
+                # external trigger - just return last reading
+                cmd = "FETCH?"
+            val = self.inst.query_ascii_values(cmd)
+            print(val)
+            print(f"READ CURRENT: {val}", file=self.log_debug)
+            ans = val[0], time.time(), AttrQuality.ATTR_VALID
         else:
-            # external trigger - just return last reading
-            ans = self.inst.query_ascii_values("FETCH?")
-        return ans[0]
+            ans = 0, time.time(), AttrQuality.ATTR_INVALID
+        return ans
 
     def read_range(self):
         return self._range
@@ -164,10 +180,12 @@ class Keithley6514(Device):
             "SYST:ZCH ON",
             "FUNC 'CURR'",
             "CURR:RANG:AUTO ON",
-            "SYST:ZCOR ON",
-            "FORM:ELEM READ,TIME",
+            "SYST:ZCOR OFF",
+            "FORM:ELEM READ",
+            # "FORM:ELEM READ,TIME",
             "TRAC:TST:FORM DELT",
             "ARM:SOUR IMM",
+            "TRIG:SOUR IMM",
             ]
         for cmd in commands:
             self.inst.write(cmd)
@@ -177,13 +195,14 @@ class Keithley6514(Device):
 
     @command(dtype_in=str, dtype_out=str)
     def query_device(self, msg):
-        print(f"qurey: {msg}", file=self.log_debug)
+        print(f"query: >> {msg}", file=self.log_debug)
         ans = self.inst.query(msg)
-        print(f"ans: {ans}", file=self.log_debug)
+        print(f"  ans: << {ans}", file=self.log_debug)
         return ans
 
     @command(dtype_in=str)
     def write_to_device(self, msg):
+        print(f"write: {msg}", file=self.log_debug)
         self.inst.write(msg)
 
     @command
@@ -205,20 +224,24 @@ class Keithley6514(Device):
             # "TRAC:FEED:CONT NEXT",
             ]
         for cmd in commands:
-            self.inst.write(cmd)
+            self.write_to_device(cmd)
         self._bufsize = num
 
     @command
     def start_save_in_buffer(self):
-        self.inst.write("TRAC:FEED:CONT NEXT")
+        self.write_to_device("TRAC:FEED:CONT NEXT")
+        self.write_to_device(f"TRIG:COUN {self._bufsize}")
+        self.write_to_device("INIT")
+        self.inst.timeout = 1000
         self.set_state(DevState.MOVING)
 
     @command(dtype_out=(float,))
     def read_buffer(self):
         """Return stored data from buffer."""
-        count = int(self.inst.query("TRAC:POIN:ACT?"))
+        count = int(self.query_device("TRAC:POIN:ACT?"))
         if count > 0:
-            data = np.array(self.inst.query_ascii_values("TRAC:DATA?")[::2])
+            data = np.array(self.inst.query_ascii_values("TRAC:DATA?"))
+            # data = np.array(self.inst.query_ascii_values("TRAC:DATA?")[::2])
             print(f"Read buffer: {count}", file=self.log_debug)
         else:
             data = np.array([-1,])
@@ -227,15 +250,21 @@ class Keithley6514(Device):
 
     @command(dtype_out=str)
     def read_and_clear_errors(self):
-        ans = self.inst.query("SYST:ERR:ALL?")
+        ans = self.query_device("SYST:ERR:ALL?")
         return ans
+
+    def _configure_singleshot(self):
+        self.inst.timeout = 3000
+        self.write_to_device("TRAC:FEED:CONT NEV")
+        self.write_to_device("TRIG:COUN 1")
 
     @command
     def abort(self):
         """Abort a running triggered measurement"""
         if self.get_state() == DevState.MOVING:
             print("ABORT trigger", file=self.log_debug)
-            self.inst.write("ABORT")
+            self.write_to_device("ABORT")
+            self._configure_singleshot()
             self.set_state(DevState.ON)
 
 
