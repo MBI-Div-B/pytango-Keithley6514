@@ -11,14 +11,13 @@ This is a rudimentary driver to enable diode current measurements
 
 import pyvisa
 import tango
-from tango import DevState, AttrQuality
-from tango.server import Device, attribute, command
-from tango.server import device_property
-from tango import READ, READ_WRITE
+from tango import DevState, AttrQuality, READ, READ_WRITE
+from tango.server import Device, attribute, command, device_property
 import numpy as np
 import sys
 import time
 from enum import IntEnum
+from threading import Thread
 
 
 class TriggerMode(IntEnum):
@@ -40,6 +39,8 @@ class Keithley6514(Device):
         "2e-3",
         "20e-3",
     ]
+
+    _TIMEOUT = 2000
 
     zerocheck = attribute(
         label="zerocheck",
@@ -87,7 +88,7 @@ class Keithley6514(Device):
         self.inst = self.rm.open_resource(f"GPIB::{self.gpib_addr}::INSTR")
         self.inst.read_termination = '\n'
         self.inst.write_termination = '\n'
-        self.inst.timeout = 1000
+        self.inst.timeout = self._TIMEOUT
         self.inst.clear()
         try:
             ans = self.query_device("*IDN?")
@@ -95,8 +96,9 @@ class Keithley6514(Device):
             if "MODEL 6514" in ans:
                 self._trigger = TriggerMode.AUTO
                 self._bufsize = 0
-                self.reset_device()
+                self.buffer = np.array([0])
                 self.set_state(DevState.ON)
+                self.reset_device()
             else:
                 self.set_state(DevState.FAULT)
                 sys.exit(255)
@@ -107,6 +109,7 @@ class Keithley6514(Device):
             sys.exit(255)
 
     def always_executed_hook(self):
+        """
         # print(f"always_executed_hook: {ans}", file=self.log_debug)
         if self.get_state() == DevState.MOVING:
             try:  # can't communicate while measuring
@@ -121,6 +124,10 @@ class Keithley6514(Device):
                     exc,
                     file=self.log_debug
                 )
+        """
+        status = self.inst.last_status
+        if status != 0:
+            print(f"always executed hook: status={status}", file=self.log_debug)
 
     def read_current(self):
         if self.get_state() == DevState.ON:
@@ -131,7 +138,6 @@ class Keithley6514(Device):
                 # external trigger - just return last reading
                 cmd = "FETCH?"
             val = self.inst.query_ascii_values(cmd)
-            print(val)
             print(f"READ CURRENT: {val}", file=self.log_debug)
             ans = val[0], time.time(), AttrQuality.ATTR_VALID
         else:
@@ -145,53 +151,59 @@ class Keithley6514(Device):
         return self._speed
 
     def write_speed(self, nplc):
-        self.inst.write(f"CURR:NPLC {nplc:.2f}")
-        self._speed = nplc
+        if self.get_state() == DevState.ON:
+            self.inst.write(f"CURR:NPLC {nplc:.2f}")
+            self._speed = nplc
 
     def read_trigger(self):
         return self._trigger
 
     def write_trigger(self, mode):
-        if mode == TriggerMode.AUTO:
-            self.inst.write("TRIG:SOUR IMM")
-        elif mode == TriggerMode.EXTERNAL:
-            self.inst.write("TRIG:SOUR TLIN")
-        self._trigger = mode
+        if self.get_state() == DevState.ON:
+            if mode == TriggerMode.AUTO:
+                self.inst.write("TRIG:SOUR IMM")
+            elif mode == TriggerMode.EXTERNAL:
+                self.inst.write("TRIG:SOUR TLIN")
+            self._trigger = mode
 
     def write_range(self, value):
-        rangestr = self.MEAS_RANGES[value]
-        print(f"set range: {rangestr}", file=self.log_debug)
-        if value == 0:
-            self.inst.write("SENS:CURR:RANG:AUTO ON")
-        else:
-            self.inst.write(f"SENS:CURR:RANG {rangestr}")
-        self._range = value
+        if self.get_state() == DevState.ON:
+            rangestr = self.MEAS_RANGES[value]
+            print(f"set range: {rangestr}", file=self.log_debug)
+            if value == 0:
+                self.inst.write("SENS:CURR:RANG:AUTO ON")
+            else:
+                self.inst.write(f"SENS:CURR:RANG {rangestr}")
+            self._range = value
 
     def read_zerocheck(self):
         return self._zch
 
     def write_zerocheck(self, zch):
-        mode = "ON" if zch else "OFF"
-        self.inst.write(f"SYST:ZCH {mode}")
-        self._zch = zch
+        if self.get_state() == DevState.ON:
+            mode = "ON" if zch else "OFF"
+            self.inst.write(f"SYST:ZCH {mode}")
+            self._zch = zch
 
     def source_setup(self):
-        commands = [
-            "SYST:ZCH ON",
-            "FUNC 'CURR'",
-            "CURR:RANG:AUTO ON",
-            "SYST:ZCOR OFF",
-            "FORM:ELEM READ",
-            # "FORM:ELEM READ,TIME",
-            "TRAC:TST:FORM DELT",
-            "ARM:SOUR IMM",
-            "TRIG:SOUR IMM",
-            ]
-        for cmd in commands:
-            self.inst.write(cmd)
-        self._zch = True
-        self._range = 0
-        self.write_speed(1)
+        if self.get_state() == DevState.ON:
+            commands = [
+                "SYST:ZCH ON",
+                "FUNC 'CURR'",
+                "CURR:RANG:AUTO ON",
+                "SYST:ZCOR OFF",
+                "FORM:ELEM READ",
+                # "FORM:ELEM READ,TIME",
+                "TRAC:TST:FORM DELT",
+                "ARM:SOUR IMM",
+                "TRIG:SOUR IMM",
+                ]
+            for cmd in commands:
+                self.inst.write(cmd)
+            self._zch = True
+            self._range = 0
+            self.write_speed(1)
+            self._configure_singleshot()
 
     @command(dtype_in=str, dtype_out=str)
     def query_device(self, msg):
@@ -213,50 +225,54 @@ class Keithley6514(Device):
 
     @command(dtype_in=int)
     def configure_buffer(self, num):
-        """Store up to <num> raw readings and time stamps in buffer.
         """
-        assert num <= 2500, "Maximum buffer size is 2500"
-        print(f"Enabling data buffer with size {num}", file=self.log_debug)
-        commands = [
-            "TRAC:CLE",
-            f"TRAC:POIN {num:d}",
-            "TRAC:FEED SENS",
-            # "TRAC:FEED:CONT NEXT",
-            ]
-        for cmd in commands:
-            self.write_to_device(cmd)
-        self._bufsize = num
+        Store up to <num> raw readings and time stamps in buffer.
+        """
+        if self.get_state() == DevState.ON:
+            assert num <= 2500, "Maximum buffer size is 2500"
+            print(f"Enabling data buffer with size {num}", file=self.log_debug)
+            commands = [
+                "TRAC:CLE",
+                f"TRAC:POIN {num:d}",
+                "TRAC:FEED SENS",
+                # "TRAC:FEED:CONT NEXT",
+                ]
+            for cmd in commands:
+                self.write_to_device(cmd)
+            self._bufsize = num
 
     @command
     def start_save_in_buffer(self):
+        if self.get_state() == DevState.ON:
+            thread = Thread(target=self._worker_measure_buffered)
+            thread.start()
+
+    def _worker_measure_buffered(self):
+        print("Starting worker thread", file=self.log_debug)
+        self.set_state(DevState.MOVING)
         self.write_to_device("TRAC:FEED:CONT NEXT")
         self.write_to_device(f"TRIG:COUN {self._bufsize}")
-        self.write_to_device("INIT")
-        self.inst.timeout = 1000
-        self.set_state(DevState.MOVING)
+        self.inst.timeout = None
+        self.buffer = self.inst.query_ascii_values("READ?")
+        self.set_state(DevState.ON)
+        self.inst.timeout = self._TIMEOUT
+        self._configure_singleshot()
 
     @command(dtype_out=(float,))
     def read_buffer(self):
         """Return stored data from buffer."""
-        count = int(self.query_device("TRAC:POIN:ACT?"))
-        if count > 0:
-            data = np.array(self.inst.query_ascii_values("TRAC:DATA?"))
-            # data = np.array(self.inst.query_ascii_values("TRAC:DATA?")[::2])
-            print(f"Read buffer: {count}", file=self.log_debug)
-        else:
-            data = np.array([-1,])
-            print(f"Read buffer: empty!", file=self.log_warn)
-        return data
+        return self.buffer
 
     @command(dtype_out=str)
     def read_and_clear_errors(self):
-        ans = self.query_device("SYST:ERR:ALL?")
-        return ans
+        if self.get_state() == DevState.ON:
+            ans = self.query_device("SYST:ERR:ALL?")
+            return ans
 
     def _configure_singleshot(self):
-        self.inst.timeout = 3000
-        self.write_to_device("TRAC:FEED:CONT NEV")
-        self.write_to_device("TRIG:COUN 1")
+        if self.get_state() == DevState.ON:
+            self.write_to_device("TRAC:FEED:CONT NEV")
+            self.write_to_device("TRIG:COUN 1")
 
     @command
     def abort(self):
