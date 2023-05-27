@@ -177,7 +177,9 @@ class Keithley6514(Device):
 
     @command(dtype_in=str, dtype_out=str)
     def query_device(self, msg):
+        print(f"qurey: {msg}", file=self.log_debug)
         ans = self.inst.query(msg)
+        print(f"ans: {ans}", file=self.log_debug)
         return ans
 
     @command(dtype_in=str)
